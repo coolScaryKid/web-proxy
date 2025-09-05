@@ -4,6 +4,7 @@ import https from "https";
 import { URL } from "url";
 import zlib from "zlib";
 import { parse } from "querystring";
+import cheerio from "cheerio";
 
 const PORT = process.env.PORT || 8080;
 
@@ -48,9 +49,32 @@ function homepage(res) {
   `);
 }
 
-// Function to inject the WebRTC-blocker script
-function inject(html) {
-  return html.replace(/<\/head>/i, `${INJECT}</head>`);
+// Rewrite all links, images, scripts, CSS, and forms to go through proxy
+function rewrite(html, base) {
+  const $ = cheerio.load(html);
+
+  // Inject WebRTC killer
+  $("head").prepend(INJECT);
+
+  const fixAttr = (selector, attr) => {
+    $(selector).each((_, el) => {
+      const val = $(el).attr(attr);
+      if (val) {
+        try {
+          const abs = new URL(val, base).href;
+          $(el).attr(attr, `/?url=${encodeURIComponent(abs)}`);
+        } catch {}
+      }
+    });
+  };
+
+  fixAttr("a", "href");
+  fixAttr("img", "src");
+  fixAttr("script", "src");
+  fixAttr("link", "href");
+  fixAttr("form", "action");
+
+  return $.html();
 }
 
 // Core proxy logic
@@ -77,7 +101,7 @@ function proxyPage(targetUrl, res) {
         if (enc.includes("gzip")) body = zlib.gunzipSync(body);
 
         if (type.includes("text/html")) {
-          body = Buffer.from(inject(body.toString()), "utf8");
+          body = Buffer.from(rewrite(body.toString(), targetUrl), "utf8");
         }
 
         res.writeHead(upRes.statusCode || 200, {
