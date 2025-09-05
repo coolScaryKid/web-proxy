@@ -1,10 +1,9 @@
-// server.js
-import http from "http";
-import https from "https";
-import { URL } from "url";
-import zlib from "zlib";
-import { parse } from "querystring";
-import cheerio from "cheerio";
+const http = require("http");
+const https = require("https");
+const { URL } = require("url");
+const zlib = require("zlib");
+const { parse } = require("querystring");
+const cheerio = require("cheerio");
 
 const PORT = process.env.PORT || 8080;
 
