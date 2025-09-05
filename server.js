@@ -1,55 +1,116 @@
 // server.js
-import http from 'http';
-import https from 'https';
-import { URL } from 'url';
-import zlib from 'zlib';
+import http from "http";
+import https from "https";
+import { URL } from "url";
+import zlib from "zlib";
+import { parse } from "querystring";
 
-// WebRTC-killer script injected into pages
+const PORT = process.env.PORT || 8080;
+
+// Script injected into every HTML page to kill WebRTC
 const INJECT = `
 <script>
 (() => {
   const Fake = function(){ throw new Error('WebRTC disabled'); };
   ['RTCPeerConnection','webkitRTCPeerConnection','RTCDataChannel','RTCIceCandidate']
     .forEach(k => { try { Object.defineProperty(window, k, { value: Fake }); } catch(e){} });
-  try { Object.defineProperty(navigator, 'mediaDevices', { value: { getUserMedia: ()=>Promise.reject(new Error('disabled')) } }); } catch(e){}
+  try { Object.defineProperty(navigator, 'mediaDevices', {
+    value: { getUserMedia: ()=>Promise.reject(new Error('disabled')) }
+  }); } catch(e){}
 })();
 </script>`;
 
+// Simple homepage with a search bar
+function homepage(res) {
+  res.writeHead(200, { "Content-Type": "text/html" });
+  res.end(`
+    <html>
+      <head>
+        <title>Free Web Proxy</title>
+        <style>
+          body { font-family: sans-serif; display:flex; height:100vh; align-items:center; justify-content:center; background:#f5f5f5; }
+          .box { background:#fff; padding:30px; border-radius:10px; box-shadow:0 4px 12px rgba(0,0,0,0.1); text-align:center; }
+          input { width:300px; padding:10px; border-radius:5px; border:1px solid #ccc; }
+          button { padding:10px 20px; margin-left:10px; border:none; background:#007BFF; color:#fff; border-radius:5px; cursor:pointer; }
+          button:hover { background:#0056b3; }
+        </style>
+      </head>
+      <body>
+        <div class="box">
+          <h2>Free Secure Proxy</h2>
+          <form method="get" action="/">
+            <input type="text" name="url" placeholder="Enter full URL (https://...)" required />
+            <button type="submit">Go</button>
+          </form>
+        </div>
+      </body>
+    </html>
+  `);
+}
+
+// Function to inject the WebRTC-blocker script
 function inject(html) {
   return html.replace(/<\/head>/i, `${INJECT}</head>`);
 }
 
-function forward(req, res) {
-  if (!req.url.startsWith('/http')) {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Use like: /https://example.com');
-    return;
-  }
+// Core proxy logic
+function proxyPage(targetUrl, res) {
+  try {
+    const target = new URL(targetUrl);
+    const proto = target.protocol === "https:" ? https : http;
 
-  const target = new URL(req.url.slice(1));
-  const opts = { headers: { 'user-agent': 'Mozilla/5.0', 'accept-encoding': 'gzip' } };
-  const proto = target.protocol === 'https:' ? https : http;
+    const opts = {
+      headers: {
+        "user-agent": "Mozilla/5.0",
+        "accept-encoding": "gzip",
+      },
+    };
 
-  proto.get(target, opts, (upRes) => {
-    let chunks = [];
-    const enc = upRes.headers['content-encoding'] || '';
-    const type = upRes.headers['content-type'] || '';
+    proto.get(target, opts, (upRes) => {
+      let chunks = [];
+      const enc = upRes.headers["content-encoding"] || "";
+      const type = upRes.headers["content-type"] || "";
 
-    upRes.on('data', d => chunks.push(d));
-    upRes.on('end', () => {
-      let body = Buffer.concat(chunks);
-      if (enc.includes('gzip')) body = zlib.gunzipSync(body);
+      upRes.on("data", (d) => chunks.push(d));
+      upRes.on("end", () => {
+        let body = Buffer.concat(chunks);
+        if (enc.includes("gzip")) body = zlib.gunzipSync(body);
 
-      if (type.includes('text/html')) {
-        body = Buffer.from(inject(body.toString()), 'utf8');
-      }
+        if (type.includes("text/html")) {
+          body = Buffer.from(inject(body.toString()), "utf8");
+        }
 
-      res.writeHead(upRes.statusCode || 200, { ...upRes.headers, 'content-encoding': 'identity' });
-      res.end(body);
+        res.writeHead(upRes.statusCode || 200, {
+          ...upRes.headers,
+          "content-encoding": "identity", // don’t double-compress
+          "permissions-policy":
+            "camera=(), microphone=(), geolocation=(), usb=(), interest-cohort=()",
+          "referrer-policy": "no-referrer",
+        });
+        res.end(body);
+      });
+    }).on("error", () => {
+      res.writeHead(502);
+      res.end("Bad gateway");
     });
-  }).on('error', () => {
-    res.writeHead(502); res.end('Bad gateway');
-  });
+  } catch (e) {
+    res.writeHead(400);
+    res.end("Invalid URL");
+  }
 }
 
-http.createServer(forward).listen(process.env.PORT || 8080);
+// HTTP server
+http
+  .createServer((req, res) => {
+    if (req.url === "/" || req.url.startsWith("/?")) {
+      const query = parse(req.url.split("?")[1]);
+      if (query.url) {
+        proxyPage(query.url, res);
+      } else {
+        homepage(res);
+      }
+    } else {
+      homepage(res);
+    }
+  })
+  .listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
