@@ -1,85 +1,97 @@
-import express from "express";
-import fetch from "node-fetch";
-import cookieParser from "cookie-parser";
-import * as cheerio from "cheerio";
+// server.js (Node 18+)
+// Minimal internal proxy handler. MUST be hardened before production (auth, allowlists, sanitizers).
+
+import express from 'express';
+import { request as undiciRequest } from 'undici'; // fast HTTP client
+import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+app.use(helmet());
+app.use(express.json({ limit: '1mb' })); // incoming proxy-control payload limit
 
-// Middleware: strip cookies and fingerprinting headers
-app.use(cookieParser());
-app.use((req, res, next) => {
-  delete req.headers.cookie;
-  delete req.headers["user-agent"];
-  next();
-});
+// simple admin / control endpoints would go here, protected by auth
 
-// Main proxy route
-app.get("/proxy", async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.status(400).send("Missing ?url= parameter");
+// rate limiting to avoid abuse
+const limiter = rateLimit({ windowMs: 1000, max: 20 });
+app.use('/_/proxy', limiter);
 
+// configure allowlist
+const HOST_ALLOWLIST = new Set([
+  'example.com',
+  'example-internal.test'
+  // add permitted hostnames
+]);
+
+function hostnameAllowed(urlStr) {
   try {
-    const response = await fetch(target, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 ProxyShield", // prevent leaking client UA
-      },
-    });
-    const contentType = response.headers.get("content-type");
+    const u = new URL(urlStr);
+    return HOST_ALLOWLIST.has(u.hostname);
+  } catch {
+    return false;
+  }
+}
 
-    // If HTML → rewrite it
-    if (contentType && contentType.includes("text/html")) {
-      const body = await response.text();
-      const $ = cheerio.load(body);
+app.post('/_/proxy', async (req, res) => {
+  try {
+    // Basic auth: ensure request is from an authenticated SW (cookie / header / mTLS)
+    // TODO: implement robust auth/CSRF protections
+    const { proxyReq, body } = req.body;
+    if (!proxyReq || !proxyReq.url) return res.status(400).send('bad request');
 
-      // Rewrite <a>, <script>, <link>, <img>, <iframe> so they go through proxy
-      $("a").each((_, el) => {
-        const href = $(el).attr("href");
-        if (href && href.startsWith("http")) {
-          $(el).attr("href", `/proxy?url=${href}`);
-        }
-      });
+    if (!hostnameAllowed(proxyReq.url)) return res.status(403).send('destination not allowed');
 
-      $("script").each((_, el) => {
-        const src = $(el).attr("src");
-        if (src && src.startsWith("http")) {
-          $(el).attr("src", `/proxy?url=${src}`);
-        }
-      });
+    // recreate headers (but ensure we never forward certain headers)
+    const outHeaders = {...(proxyReq.headers || {})};
+    delete outHeaders['cookie'];
+    delete outHeaders['authorization'];
+    delete outHeaders['proxy-authorization'];
+    // enforce a safe User-Agent
+    outHeaders['user-agent'] = 'internal-sandbox-proxy/1.0';
 
-      $("link").each((_, el) => {
-        const href = $(el).attr("href");
-        if (href && href.startsWith("http")) {
-          $(el).attr("href", `/proxy?url=${href}`);
-        }
-      });
-
-      $("img").each((_, el) => {
-        const src = $(el).attr("src");
-        if (src && src.startsWith("http")) {
-          $(el).attr("src", `/proxy?url=${src}`);
-        }
-      });
-
-      $("iframe").each((_, el) => {
-        const src = $(el).attr("src");
-        if (src && src.startsWith("http")) {
-          $(el).attr("src", `/proxy?url=${src}`);
-        }
-      });
-
-      res.set("Content-Type", "text/html");
-      res.send($.html());
-    } else {
-      // Non-HTML (CSS, JS, images, etc.)
-      res.set("Content-Type", contentType || "application/octet-stream");
-      response.body.pipe(res);
+    // handle body
+    let bodyStream = null;
+    if (body) {
+      // body was base64-encoded
+      const buf = Buffer.from(body, 'base64');
+      bodyStream = buf;
     }
+
+    // perform outbound request with timeouts and streaming
+    const clientRes = await undiciRequest(proxyReq.url, {
+      method: proxyReq.method,
+      headers: outHeaders,
+      body: bodyStream,
+      maxRedirections: 5,
+      throwOnError: true,
+      // timeouts
+      headersTimeout: 10_000,
+      bodyTimeout: 30_000
+    });
+
+    // stream response back but do not forward dangerous headers
+    const safeHeaders = {};
+    for (const [k, v] of clientRes.headers) {
+      const lk = k.toLowerCase();
+      if (['set-cookie', 'set-cookie2', 'server'].includes(lk)) continue;
+      safeHeaders[k] = v;
+    }
+    // stream body into memory up to a limit (example). For larger payloads, stream and chunk.
+    const buffer = await clientRes.body.arrayBuffer();
+    if (buffer.byteLength > 10 * 1024 * 1024) { // 10 MB cap (example)
+      return res.status(502).send('Response too large');
+    }
+
+    res.json({
+      status: clientRes.statusCode,
+      headers: safeHeaders,
+      bodyBase64: Buffer.from(buffer).toString('base64')
+    });
+
   } catch (err) {
-    res.status(500).send("Proxy error: " + err.message);
+    console.error('Proxy error', err);
+    res.status(502).send('proxy error');
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Proxy running at http://localhost:${PORT}`);
-});
+app.listen(8443, () => console.log('Proxy listening on 8443'));
