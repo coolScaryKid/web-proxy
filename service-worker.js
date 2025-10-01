@@ -1,92 +1,89 @@
 // service-worker.js
-const PROXY_ENDPOINT = '/_/proxy'; // internal proxy endpoint on same origin
-const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MB request limit (example)
+const PROXY_API = '/api/proxy';
+const TOKEN_API = '/api/token'; // used by client to obtain a short-lived JWT
+const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MB
 
-self.addEventListener('install', event => {
-  event.waitUntil(self.skipWaiting());
-});
+self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 
-self.addEventListener('activate', event => {
-  event.waitUntil(self.clients.claim());
-});
-
-// small helper to copy headers to plain object
-function headersToObject(headers) {
-  const obj = {};
-  for (const [k, v] of headers.entries()) obj[k] = v;
-  return obj;
+async function getToken() {
+  // The page should fetch the token from a protected endpoint (e.g., admin UI or a cookie protected endpoint).
+  // Here we request /api/token which should return { token } when the user is authenticated.
+  try {
+    const resp = await fetch(TOKEN_API, { credentials: 'include' });
+    if (!resp.ok) throw new Error('token fetch failed');
+    const j = await resp.json();
+    return j.token;
+  } catch (err) {
+    console.error('token error', err);
+    return null;
+  }
 }
 
-// sanitize request before sending to proxy
-function buildProxyRequest(originalRequest) {
-  const url = new URL(originalRequest.url);
-
-  // enforce same-origin scope: allow only requests we intend to proxy
-  // (customize allowlist rules here)
-  if (!url.protocol.startsWith('http')) throw new Error('Non-http(s) not allowed');
-
-  // Remove disallowed headers (Authorization, Cookie etc.) by default
-  const forbidden = ['authorization', 'cookie', 'proxy-authorization', 'x-forwarded-for'];
-  const headers = {};
-  for (const [k, v] of originalRequest.headers.entries()) {
-    if (!forbidden.includes(k.toLowerCase())) headers[k] = v;
-  }
-
-  return {
-    method: originalRequest.method,
-    url: originalRequest.url,
-    headers,
-    // note: body streaming in Service Worker is available via clone().arrayBuffer() or .blob()
-    // keep small; for large streaming requests, implement chunked upload to /_/proxy/upload
-  };
+function headersToObject(headers) {
+  const o = {};
+  for (const [k, v] of headers.entries()) o[k] = v;
+  return o;
 }
 
 self.addEventListener('fetch', event => {
   const req = event.request;
 
-  // You may want to limit which requests are proxied. Example: only top-level document & subresources.
-  const isNavigation = req.mode === 'navigate';
-  const shouldProxy = true; // implement allowlist logic here
+  // Heuristic: only proxy navigations and subresource requests from your controlled pages.
+  // Tweak `shouldProxy` allowlist as required.
+  const url = new URL(req.url);
+  const isSameOrigin = url.origin === self.location.origin;
+  const shouldProxy = !isSameOrigin && (req.mode === 'navigate' || req.destination);
 
   if (!shouldProxy) return; // let normal fetch proceed
 
-  event.respondWith((async function() {
+  event.respondWith((async () => {
     try {
-      const proxyReq = buildProxyRequest(req);
-      let body = null;
+      const token = await getToken();
+      if (!token) return new Response('Unauthorized', { status: 401 });
+
+      // Build proxy payload
+      const proxyReq = {
+        method: req.method,
+        url: req.url,
+        headers: headersToObject(req.headers)
+      };
+
+      let bodyBase64 = null;
       if (req.method !== 'GET' && req.method !== 'HEAD') {
-        // small-body read; abort if too large
-        const ab = await req.clone().arrayBuffer();
-        if (ab.byteLength > MAX_BODY_BYTES) {
-          return new Response('Request body too large', { status: 413 });
-        }
-        // we base64 encode binary body to keep JSON simple (or use multipart/stream)
-        body = btoa(String.fromCharCode(...new Uint8Array(ab)));
+        const clone = req.clone();
+        const ab = await clone.arrayBuffer();
+        if (ab.byteLength > MAX_BODY_BYTES) return new Response('Request body too large', { status: 413 });
+        bodyBase64 = btoa(String.fromCharCode(...new Uint8Array(ab)));
       }
 
-      const resp = await fetch(PROXY_ENDPOINT, {
+      // POST to backend proxy endpoint with token in Authorization header
+      const resp = await fetch(PROXY_API, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ proxyReq, body })
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ proxyReq, bodyBase64 }),
+        credentials: 'omit'
       });
 
-      // Proxy server returns: { status, headers, bodyBase64 } streamed or in one chunk
-      if (!resp.ok) return resp;
+      // If backend responds with a direct passthrough response (stream), return it
+      if (!resp.ok) {
+        // bubble up failure code & body
+        const txt = await resp.text();
+        return new Response(txt, { status: resp.status });
+      }
 
-      // If server streams a real Response, we can instead do `return resp` directly.
-      const proxyResp = await resp.json();
-      const headers = new Headers(proxyResp.headers || {});
-      // set safe headers, override Content-Security-Policy (example)
-      headers.set('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline';");
-      // ensure we do not allow top navigation by default
-      headers.set('X-Frame-Options', 'DENY');
+      // We expect the backend to respond with a streamed Response body and safe headers.
+      // For the example, backend sends full response as a normal fetch response we can just return.
+      // If backend JSON-encodes body, adapt as needed.
+      // To support streaming: backend should respond with what the SW can `return resp` directly.
+      return resp;
 
-      const bodyBytes = proxyResp.bodyBase64 ? Uint8Array.from(atob(proxyResp.bodyBase64), c => c.charCodeAt(0)) : new Uint8Array();
-      return new Response(bodyBytes, { status: proxyResp.status, headers });
     } catch (err) {
-      console.error('Proxy SW error', err);
-      return new Response('Proxy error', { status: 502 });
+      console.error('SW proxy error', err);
+      return new Response('Proxy failure', { status: 502 });
     }
   })());
 });
