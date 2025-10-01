@@ -1,0 +1,17 @@
+<!-- host.html -->
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/service-worker.js').then(reg => {
+    console.log('SW registered', reg);
+  });
+}
+
+// fetch a proxied URL and render in a sandbox iframe
+async function openProxied(url) {
+  // navigate top-level to a local page that loads content via the SW (or create an iframe)
+  const iframe = document.createElement('iframe');
+  iframe.sandbox = 'allow-scripts allow-same-origin'; // tune permissions carefully
+  iframe.src = '/proxy-viewer?url=' + encodeURIComponent(url);
+  document.body.appendChild(iframe);
+}
+</script>
